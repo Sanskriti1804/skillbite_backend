@@ -37,7 +37,9 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
     res.status(200).json(await auth.verifyEmail(token));
   }));
   router.post("/auth/login", asyncHandler(async (req, res) => {
-    res.status(200).json(await auth.login(body(req).email, body(req).password));
+    const payload = body(req);
+    const emailOrUsername = payload.emailOrUsername ?? payload.email;
+    res.status(200).json(await auth.login(emailOrUsername, payload.password));
   }));
   router.post("/auth/password-reset", asyncHandler(async (req, res) => {
     res.status(200).json(await auth.startReset(body(req).email));
@@ -63,10 +65,18 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
     const session = await requireAuth(req);
     res.status(200).json(await admin.me(session.userId));
   }));
+  router.patch("/me/username", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    res.status(200).json(await auth.updateUsername(session.userId, body(req).username));
+  }));
   router.patch("/me/role", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);
     requireRole(session, ["USER", "CREATOR"]);
     res.status(200).json(await admin.switchRole(session.userId, body(req).role, access.roleId));
+  }));
+  router.get("/me/content", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    res.status(200).json(await content.mine(session.userId));
   }));
 
   router.post("/videos", asyncHandler(async (req, res) => {
@@ -85,6 +95,12 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
     res.status(200).json(await content.saveMedia(session, req.params.contentId, body(req)));
   }));
   router.get("/videos/:contentId/media", asyncHandler(async (req, res) => {
+    const quality = req.query.quality === "full" ? "full" : "feed";
+    const playbackUrl = await content.playbackUrl(req.params.contentId, () => requireAuth(req), quality);
+    if (playbackUrl) {
+      res.redirect(302, playbackUrl);
+      return;
+    }
     const bytes = await content.readMedia(req.params.contentId, () => requireAuth(req));
     res.status(200).type("video/mp4").send(bytes);
   }));
@@ -97,6 +113,11 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
     const session = await requireAuth(req);
     requireRole(session, ["CREATOR", "ADMIN"]);
     res.status(200).json(await content.takedown(session, req.params.contentId));
+  }));
+  router.delete("/videos/:contentId", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    requireRole(session, ["CREATOR", "ADMIN"]);
+    res.status(200).json(await content.deleteVideo(session, req.params.contentId));
   }));
   router.post("/videos/:contentId/captions", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);
@@ -134,6 +155,21 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
     requireRole(session, ["CREATOR", "ADMIN"]);
     res.status(201).json(await content.addLesson(session, req.params.moduleId, body(req)));
   }));
+  router.delete("/modules/:moduleId/lessons/:lessonId", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    requireRole(session, ["CREATOR", "ADMIN"]);
+    res.status(200).json(await content.removeLesson(session, req.params.moduleId, req.params.lessonId));
+  }));
+  router.post("/courses/:contentId/videos", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    requireRole(session, ["CREATOR", "ADMIN"]);
+    res.status(201).json(await content.addVideoToCourse(session, req.params.contentId, body(req).videoContentId));
+  }));
+  router.delete("/courses/:contentId", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    requireRole(session, ["CREATOR", "ADMIN"]);
+    res.status(200).json(await content.deleteCourse(session, req.params.contentId));
+  }));
   router.post("/courses/:contentId/publish", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);
     requireRole(session, ["CREATOR", "ADMIN"]);
@@ -142,6 +178,9 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
 
   router.get("/categories", asyncHandler(async (_req, res) => {
     res.status(200).json(await content.categories());
+  }));
+  router.get("/tags", asyncHandler(async (_req, res) => {
+    res.status(200).json(await content.tags());
   }));
   router.get("/content", asyncHandler(async (req, res) => {
     res.status(200).json(await content.search(req.query));

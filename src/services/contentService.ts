@@ -3,19 +3,68 @@ import { LIST_LIMIT } from "../deps.js";
 import { HttpError } from "../errors.js";
 import type { Access } from "./access.js";
 
+type FeedItem = {
+  contentId: string;
+  contentType: string;
+  title: string;
+  description: string | null;
+  publishedAt: Date | null;
+  hasMedia?: boolean;
+  mediaUrl?: string | null;
+  categories: Array<{ name: string; slug: string }>;
+};
+
+function shuffleInPlace<T>(items: T[]): T[] {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = items[i]!;
+    items[i] = items[j]!;
+    items[j] = tmp;
+  }
+  return items;
+}
+
+/** Mix categories so Home does not play one folder in a row. */
+function interleaveByCategory(items: FeedItem[]): FeedItem[] {
+  const buckets = new Map<string, FeedItem[]>();
+  for (const item of items) {
+    const key = item.categories[0]?.slug || "uncategorized";
+    const list = buckets.get(key) ?? [];
+    list.push(item);
+    buckets.set(key, list);
+  }
+  for (const list of buckets.values()) shuffleInPlace(list);
+  const keys = shuffleInPlace([...buckets.keys()]);
+  const queues = keys.map((key) => buckets.get(key) ?? []);
+  const mixed: FeedItem[] = [];
+  let added = true;
+  while (added) {
+    added = false;
+    for (const queue of queues) {
+      const next = queue.shift();
+      if (!next) continue;
+      mixed.push(next);
+      added = true;
+    }
+  }
+  return mixed;
+}
+
 export function createContentService(access: Access) {
   const { prisma, deps, ownContent } = access;
 
   return {
     async createVideo(userId: string, body: Record<string, unknown>) {
-      const title = typeof body.title === "string" ? body.title.trim() : "";
-      if (!title) throw new HttpError(400, "validation", "Title is required");
+      const description = typeof body.description === "string" ? body.description.trim() : "";
+      if (!description) throw new HttpError(400, "validation", "Description is required");
+      const titleRaw = typeof body.title === "string" ? body.title.trim() : "";
+      const title = titleRaw || (description.length > 80 ? `${description.slice(0, 77)}...` : description);
       const content = await prisma.content.create({
         data: {
           creatorId: userId,
           contentType: "VIDEO",
           title,
-          description: typeof body.description === "string" ? body.description : null,
+          description,
           keywords: typeof body.keywords === "string" ? body.keywords : null,
           status: "DRAFT",
           video: {
@@ -32,23 +81,60 @@ export function createContentService(access: Access) {
           if (typeof tagId === "string") await prisma.contentTag.create({ data: { contentId: content.contentId, tagId } });
         }
       }
+      if (Array.isArray(body.categoryIds)) {
+        for (const categoryId of body.categoryIds) {
+          if (typeof categoryId === "string") {
+            await prisma.contentCategory.create({ data: { contentId: content.contentId, categoryId } });
+          }
+        }
+      }
       return { contentId: content.contentId, status: "DRAFT" as const };
     },
 
     async updateVideo(auth: Parameters<typeof ownContent>[0], contentId: string, body: Record<string, unknown>) {
       const content = await ownContent(auth, contentId);
       if (content.contentType !== "VIDEO") throw new HttpError(404, "not_found", "Not found");
-      if (content.status === "PUBLISHED") throw new HttpError(409, "conflict", "Published video cannot be edited in place");
+      if (content.deletedAt) throw new HttpError(404, "not_found", "Not found");
+      const nextStatus = body.status === "DRAFT" || body.status === "PUBLISHED" || body.status === "UNPUBLISHED"
+        ? body.status
+        : undefined;
       await prisma.content.update({
         where: { contentId: content.contentId },
         data: {
           title: typeof body.title === "string" ? body.title : undefined,
           description: typeof body.description === "string" ? body.description : undefined,
           keywords: typeof body.keywords === "string" ? body.keywords : undefined,
+          status: nextStatus,
           video: typeof body.sources === "string" ? { update: { sources: body.sources } } : undefined,
         },
       });
-      return { contentId: content.contentId };
+      if (Array.isArray(body.categoryIds)) {
+        await prisma.contentCategory.deleteMany({ where: { contentId: content.contentId } });
+        for (const categoryId of body.categoryIds) {
+          if (typeof categoryId === "string") {
+            await prisma.contentCategory.create({ data: { contentId: content.contentId, categoryId } });
+          }
+        }
+      }
+      if (Array.isArray(body.tagIds)) {
+        await prisma.contentTag.deleteMany({ where: { contentId: content.contentId } });
+        for (const tagId of body.tagIds) {
+          if (typeof tagId === "string") {
+            await prisma.contentTag.create({ data: { contentId: content.contentId, tagId } });
+          }
+        }
+      }
+      return { contentId: content.contentId, status: nextStatus ?? content.status };
+    },
+
+    async deleteVideo(auth: Parameters<typeof ownContent>[0], contentId: string) {
+      const content = await ownContent(auth, contentId);
+      if (content.contentType !== "VIDEO") throw new HttpError(404, "not_found", "Not found");
+      await prisma.content.update({
+        where: { contentId: content.contentId },
+        data: { deletedAt: new Date(), status: "REMOVED" },
+      });
+      return { status: "REMOVED" as const };
     },
 
     async saveMedia(auth: Parameters<typeof ownContent>[0], contentId: string, body: Record<string, unknown>) {
@@ -58,7 +144,13 @@ export function createContentService(access: Access) {
       if (!mime.startsWith("video/")) throw new HttpError(400, "validation", "File must be a video");
       const bytes = Buffer.from(data, "base64");
       if (bytes.length === 0) throw new HttpError(400, "validation", "File is empty");
-      const reference = await deps.storage.saveVideo(content.contentId, bytes);
+      const category = await prisma.contentCategory.findFirst({
+        where: { contentId: content.contentId },
+        include: { category: true },
+      });
+      const reference = await deps.storage.saveVideo(content.contentId, bytes, {
+        categorySlug: category?.category.slug,
+      });
       await prisma.videoDetails.update({
         where: { contentId: content.contentId },
         data: {
@@ -70,22 +162,49 @@ export function createContentService(access: Access) {
     },
 
     async readMedia(contentId: string, getAuth: () => Promise<Parameters<typeof ownContent>[0]>) {
-      const content = await prisma.content.findUnique({ where: { contentId }, include: { video: true } });
-      if (!content?.video || !content.video.mediaReference) throw new HttpError(404, "not_found", "Not found");
-      const published = content.status === "PUBLISHED" && !content.deletedAt;
+      const row = await prisma.content.findUnique({ where: { contentId }, include: { video: true } });
+      if (!row?.video || !row.video.mediaReference) throw new HttpError(404, "not_found", "Not found");
+      const published = row.status === "PUBLISHED" && !row.deletedAt;
       if (!published) {
         const auth = await getAuth();
-        if (auth.role !== "ADMIN" && auth.userId !== content.creatorId) throw new HttpError(403, "forbidden", "Not allowed");
+        if (auth.role !== "ADMIN" && auth.userId !== row.creatorId) throw new HttpError(403, "forbidden", "Not allowed");
       }
-      return deps.storage.read(content.video.mediaReference);
+      return deps.storage.read(row.video.mediaReference);
+    },
+
+    async playbackUrl(
+      contentId: string,
+      getAuth: () => Promise<Parameters<typeof ownContent>[0]>,
+      quality: "feed" | "full" = "feed",
+    ) {
+      const row = await prisma.content.findUnique({ where: { contentId }, include: { video: true } });
+      if (!row?.video || !row.video.mediaReference) throw new HttpError(404, "not_found", "Not found");
+      const published = row.status === "PUBLISHED" && !row.deletedAt;
+      if (!published) {
+        const auth = await getAuth();
+        if (auth.role !== "ADMIN" && auth.userId !== row.creatorId) throw new HttpError(403, "forbidden", "Not allowed");
+      }
+      return deps.storage.playbackUrl(row.video.mediaReference, quality);
     },
 
     async publishVideo(auth: Parameters<typeof ownContent>[0], contentId: string) {
       const content = await ownContent(auth, contentId);
       const video = content.video;
-      const tagCount = await prisma.contentTag.count({ where: { contentId: content.contentId } });
-      if (!video?.mediaReference || !content.description || !content.keywords || !video.sources || tagCount < 1) {
-        throw new HttpError(400, "validation", "Required video fields are missing");
+      if (!video?.mediaReference || !content.description?.trim()) {
+        throw new HttpError(400, "validation", "Video needs media and a description before publish");
+      }
+      if (!content.keywords?.trim() || !video.sources?.trim()) {
+        await prisma.content.update({
+          where: { contentId: content.contentId },
+          data: {
+            keywords: content.keywords?.trim() || "tutorial, short-form",
+            video: {
+              update: {
+                sources: video.sources?.trim() || "Original creator material",
+              },
+            },
+          },
+        });
       }
       await prisma.content.update({
         where: { contentId: content.contentId },
@@ -182,18 +301,84 @@ export function createContentService(access: Access) {
       const module = await prisma.courseModule.findUnique({ where: { moduleId } });
       if (!module) throw new HttpError(404, "not_found", "Not found");
       await ownContent(auth, module.courseContentId);
-      const title = typeof body.title === "string" ? body.title.trim() : "";
-      const position = body.position;
       const videoContentId = typeof body.videoContentId === "string" ? body.videoContentId : "";
-      if (!title || !videoContentId || !Number.isInteger(position) || (position as number) < 1) {
-        throw new HttpError(400, "validation", "Lesson name, video, and position are required");
+      const position = body.position;
+      if (!videoContentId || !Number.isInteger(position) || (position as number) < 1) {
+        throw new HttpError(400, "validation", "Video and position are required");
       }
+      const video = await prisma.content.findUnique({ where: { contentId: videoContentId } });
+      if (!video || video.contentType !== "VIDEO" || video.deletedAt) {
+        throw new HttpError(404, "not_found", "Video not found");
+      }
+      const titleRaw = typeof body.title === "string" ? body.title.trim() : "";
+      const title = titleRaw || (video.description?.trim() || video.title || "Video").slice(0, 80);
       try {
         const lesson = await prisma.lesson.create({ data: { moduleId: module.moduleId, title, position: position as number, videoContentId } });
         return { lessonId: lesson.lessonId };
       } catch {
-        throw new HttpError(409, "conflict", "Lesson conflicts with an existing row");
+        throw new HttpError(409, "conflict", "Video is already in a playlist or position is taken");
       }
+    },
+
+    async removeLesson(auth: Parameters<typeof ownContent>[0], moduleId: string, lessonId: string) {
+      const module = await prisma.courseModule.findUnique({ where: { moduleId } });
+      if (!module) throw new HttpError(404, "not_found", "Not found");
+      await ownContent(auth, module.courseContentId);
+      const lesson = await prisma.lesson.findUnique({ where: { lessonId } });
+      if (!lesson || lesson.moduleId !== moduleId) throw new HttpError(404, "not_found", "Not found");
+      await prisma.lesson.delete({ where: { lessonId } });
+      return { status: "ok" as const };
+    },
+
+    async addVideoToCourse(auth: Parameters<typeof ownContent>[0], courseContentId: string, videoContentIdRaw: unknown) {
+      const content = await ownContent(auth, courseContentId);
+      if (content.contentType !== "COURSE" || content.deletedAt) throw new HttpError(404, "not_found", "Not found");
+      const videoContentId = typeof videoContentIdRaw === "string" ? videoContentIdRaw : "";
+      if (!videoContentId) throw new HttpError(400, "validation", "Video is required");
+      const video = await prisma.content.findUnique({ where: { contentId: videoContentId } });
+      if (!video || video.contentType !== "VIDEO" || video.deletedAt) {
+        throw new HttpError(404, "not_found", "Video not found");
+      }
+      const already = await prisma.lesson.findUnique({ where: { videoContentId } });
+      if (already) throw new HttpError(409, "conflict", "Video is already in a playlist");
+
+      let module = await prisma.courseModule.findFirst({
+        where: { courseContentId },
+        orderBy: { position: "asc" },
+        include: { lessons: true },
+      });
+      if (!module) {
+        module = await prisma.courseModule.create({
+          data: { courseContentId, title: "Videos", position: 1 },
+          include: { lessons: true },
+        });
+      }
+      const position = module.lessons.length + 1;
+      const title = (video.description?.trim() || video.title || "Video").slice(0, 80);
+      const lesson = await prisma.lesson.create({
+        data: { moduleId: module.moduleId, title, position, videoContentId },
+      });
+      return { lessonId: lesson.lessonId, moduleId: module.moduleId, position };
+    },
+
+    async deleteCourse(auth: Parameters<typeof ownContent>[0], contentId: string) {
+      const content = await ownContent(auth, contentId);
+      if (content.contentType !== "COURSE") throw new HttpError(404, "not_found", "Not found");
+      const modules = await prisma.courseModule.findMany({
+        where: { courseContentId: content.contentId },
+        select: { moduleId: true },
+      });
+      await prisma.$transaction(async (tx) => {
+        for (const module of modules) {
+          await tx.lesson.deleteMany({ where: { moduleId: module.moduleId } });
+        }
+        await tx.courseModule.deleteMany({ where: { courseContentId: content.contentId } });
+        await tx.content.update({
+          where: { contentId: content.contentId },
+          data: { deletedAt: new Date(), status: "REMOVED" },
+        });
+      });
+      return { status: "REMOVED" as const };
     },
 
     async publishCourse(auth: Parameters<typeof ownContent>[0], contentId: string) {
@@ -208,8 +393,8 @@ export function createContentService(access: Access) {
       for (const module of modules) {
         for (const lesson of module.lessons) {
           const videoContent = lesson.video.content;
-          const ready = lesson.title && lesson.video.mediaReference && videoContent.description && videoContent.keywords && lesson.video.sources && videoContent.tags.length > 0;
-          if (!ready) throw new HttpError(400, "validation", "Each lesson video is missing required fields");
+          const ready = lesson.video.mediaReference && videoContent.description?.trim();
+          if (!ready) throw new HttpError(400, "validation", "Each lesson video needs media and a description");
         }
       }
       await prisma.content.update({
@@ -219,14 +404,43 @@ export function createContentService(access: Access) {
       return { status: "PUBLISHED" as const };
     },
 
+    async mine(userId: string) {
+      const items = await prisma.content.findMany({
+        where: { creatorId: userId, deletedAt: null },
+        orderBy: { updatedAt: "desc" },
+        take: LIST_LIMIT,
+        include: { video: true },
+      });
+      return {
+        limit: LIST_LIMIT,
+        items: items.map((item) => ({
+          contentId: item.contentId,
+          contentType: item.contentType,
+          title: item.title,
+          description: item.description,
+          status: item.status,
+          updatedAt: item.updatedAt,
+          publishedAt: item.publishedAt,
+          hasMedia: Boolean(item.video?.mediaReference),
+        })),
+      };
+    },
+
     async categories() {
       const items = await prisma.category.findMany({ where: { isActive: true }, orderBy: { name: "asc" } });
       return { items };
     },
 
-    async search(query: { q?: unknown; category?: unknown }) {
+    async tags() {
+      const items = await prisma.tag.findMany({ orderBy: { name: "asc" } });
+      return { items };
+    },
+
+    async search(query: { q?: unknown; category?: unknown; sort?: unknown }) {
       const q = typeof query.q === "string" ? query.q.trim() : "";
       const category = typeof query.category === "string" ? query.category : "";
+      const sort = typeof query.sort === "string" ? query.sort.trim().toLowerCase() : "newest";
+      const random = sort === "random" || sort === "mixed";
       const where: Prisma.ContentWhereInput = { status: "PUBLISHED", deletedAt: null };
       if (q) {
         where.OR = [
@@ -237,27 +451,50 @@ export function createContentService(access: Access) {
         ];
       }
       if (category) where.categories = { some: { category: { slug: category } } };
-      const items = await prisma.content.findMany({
+      const rows = await prisma.content.findMany({
         where,
-        take: LIST_LIMIT,
+        take: random ? Math.max(LIST_LIMIT * 3, 60) : LIST_LIMIT,
         orderBy: { publishedAt: "desc" },
-        include: { video: true },
+        include: {
+          video: true,
+          categories: { include: { category: true } },
+        },
       });
-      return {
-        limit: LIST_LIMIT,
-        items: items.map((item) => ({
+
+      const mapped = rows.map((item) => {
+        const reference = item.video?.mediaReference ?? "";
+        return {
           contentId: item.contentId,
           contentType: item.contentType,
           title: item.title,
+          description: item.description,
           publishedAt: item.publishedAt,
-        })),
+          hasMedia: Boolean(reference),
+          mediaUrl: reference ? deps.storage.playbackUrl(reference, "feed") : null,
+          categories: item.categories.map((row) => ({
+            name: row.category.name,
+            slug: row.category.slug,
+          })),
+        };
+      });
+
+      const items = random ? interleaveByCategory(mapped).slice(0, LIST_LIMIT * 2) : mapped;
+      return {
+        limit: items.length,
+        items,
       };
     },
 
     async contentDetail(contentId: string, getAuth: () => Promise<Parameters<typeof ownContent>[0]>) {
       const content = await prisma.content.findUnique({
         where: { contentId },
-        include: { video: true, course: { include: { modules: { include: { lessons: true }, orderBy: { position: "asc" } } } }, attachments: true },
+        include: {
+          video: true,
+          course: { include: { modules: { include: { lessons: true }, orderBy: { position: "asc" } } } },
+          attachments: true,
+          categories: { include: { category: true } },
+          tags: { include: { tag: true } },
+        },
       });
       if (!content || content.deletedAt) throw new HttpError(404, "not_found", "Not found");
       if (content.status !== "PUBLISHED") {
@@ -273,7 +510,20 @@ export function createContentService(access: Access) {
         contentType: content.contentType,
         title: content.title,
         description: content.description,
+        keywords: content.keywords,
+        sources: content.video?.sources ?? null,
         status: content.status,
+        hasMedia: Boolean(content.video?.mediaReference),
+        categories: content.categories.map((row) => ({
+          categoryId: row.category.categoryId,
+          name: row.category.name,
+          slug: row.category.slug,
+        })),
+        tags: content.tags.map((row) => ({
+          tagId: row.tag.tagId,
+          name: row.tag.name,
+          slug: row.tag.slug,
+        })),
         modules: content.course?.modules.map((module) => ({
           moduleId: module.moduleId,
           title: module.title,

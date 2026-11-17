@@ -104,12 +104,19 @@ test("migration, constraints, and API", async (t) => {
       data: {
         roleId: userRole.roleId,
         emailNormalized: "dup@example.com",
+        usernameNormalized: "dup_user",
         displayName: "Dup",
         accountStatus: "ACTIVE",
       },
     });
     await assert.rejects(() => prisma.appUser.create({
-      data: { roleId: userRole.roleId, emailNormalized: "dup@example.com", displayName: "Dup2", accountStatus: "ACTIVE" },
+      data: {
+        roleId: userRole.roleId,
+        emailNormalized: "dup@example.com",
+        usernameNormalized: "dup_user2",
+        displayName: "Dup2",
+        accountStatus: "ACTIVE",
+      },
     }));
     const video = await prisma.content.create({
       data: {
@@ -158,6 +165,7 @@ test("migration, constraints, and API", async (t) => {
       email: "ada@example.com",
       password: "password1",
       displayName: "Ada",
+      username: "ada",
       role: "CREATOR",
     });
     assert.equal(created.status, 201);
@@ -165,6 +173,7 @@ test("migration, constraints, and API", async (t) => {
       email: "weak@example.com",
       password: "short",
       displayName: "Weak",
+      username: "weak",
       role: "USER",
     });
     assert.equal(weak.status, 400);
@@ -172,9 +181,18 @@ test("migration, constraints, and API", async (t) => {
       email: "ada@example.com",
       password: "password1",
       displayName: "Ada",
+      username: "ada2",
       role: "USER",
     });
     assert.equal(duplicate.status, 409);
+    const duplicateUsername = await json(base, "POST", "/api/v1/auth/register", {
+      email: "ada2@example.com",
+      password: "password1",
+      displayName: "Ada Two",
+      username: "ada",
+      role: "USER",
+    });
+    assert.equal(duplicateUsername.status, 409);
     const token = captured[0]?.token ?? "";
     const stored = await prisma.authToken.findFirst({ where: { tokenHash: sha256(token) } });
     assert.ok(stored);
@@ -189,6 +207,18 @@ test("migration, constraints, and API", async (t) => {
     assert.equal(login.status, 200);
     const me = await json(base, "GET", "/api/v1/me", undefined, login.body.accessToken);
     assert.equal(me.body.role, "CREATOR");
+    assert.equal(me.body.username, "ada");
+    const byUsername = await json(base, "POST", "/api/v1/auth/login", {
+      emailOrUsername: "ada",
+      password: "password1",
+    });
+    assert.equal(byUsername.status, 200);
+    const renamed = await json(base, "PATCH", "/api/v1/me/username", { username: "ada_creator" }, byUsername.body.accessToken);
+    assert.equal(renamed.status, 200);
+    assert.equal(renamed.body.username, "ada_creator");
+    assert.equal((await json(base, "POST", "/api/v1/auth/login", { emailOrUsername: "ada", password: "password1" })).status, 401);
+    assert.equal((await json(base, "POST", "/api/v1/auth/login", { emailOrUsername: "ada_creator", password: "password1" })).status, 200);
+    await json(base, "PATCH", "/api/v1/me/username", { username: "ada" }, byUsername.body.accessToken);
     const refreshed = await json(base, "POST", "/api/v1/auth/refresh", { refreshToken: login.body.refreshToken });
     assert.equal(refreshed.status, 200);
     const reused = await json(base, "POST", "/api/v1/auth/refresh", { refreshToken: login.body.refreshToken });
@@ -230,6 +260,7 @@ test("migration, constraints, and API", async (t) => {
       data: {
         roleId: adminRole.roleId,
         emailNormalized: "admin@example.com",
+        usernameNormalized: "admin_user",
         displayName: "Admin",
         accountStatus: "ACTIVE",
         passwordHash: (await prisma.appUser.findUniqueOrThrow({ where: { emailNormalized: "ada@example.com" } })).passwordHash,
@@ -254,11 +285,11 @@ test("migration, constraints, and API", async (t) => {
     const adminToken = admin.body.accessToken;
     const tag = await json(base, "POST", "/api/v1/admin/tags", { name: "Basics", slug: "basics" }, adminToken);
     const other = await json(base, "POST", "/api/v1/auth/register", {
-      email: "bea@example.com", password: "password1", displayName: "Bea", role: "CREATOR",
+      email: "bea@example.com", password: "password1", displayName: "Bea", username: "bea", role: "CREATOR",
     });
     assert.equal(other.status, 201);
     const bea = await json(base, "POST", "/api/v1/auth/login", { email: "bea@example.com", password: "password1" });
-    const video = await json(base, "POST", "/api/v1/videos", { title: "Intro", durationSeconds: 100 }, token);
+    const video = await json(base, "POST", "/api/v1/videos", { description: "Intro lesson", durationSeconds: 100 }, token);
     const contentId = video.body.contentId;
     assert.equal((await json(base, "PATCH", `/api/v1/videos/${contentId}`, { title: "Stolen" }, bea.body.accessToken)).status, 403);
     assert.equal((await json(base, "PUT", `/api/v1/videos/${contentId}/media`, { mimeType: "text/plain", dataBase64: Buffer.from("hi").toString("base64") }, token)).status, 400);
@@ -270,11 +301,10 @@ test("migration, constraints, and API", async (t) => {
     assert.equal(media.status, 200);
     assert.equal((await json(base, "GET", `/api/v1/videos/${contentId}/media`, undefined, bea.body.accessToken)).status, 403);
     assert.equal((await json(base, "POST", `/api/v1/videos/${contentId}/publish`)).status, 401);
-    assert.equal((await json(base, "POST", `/api/v1/videos/${contentId}/publish`, undefined, token)).status, 400);
     await json(base, "PATCH", `/api/v1/videos/${contentId}`, { description: "About", keywords: "intro", sources: "notes" }, token);
     await prisma.contentTag.create({ data: { contentId, tagId: tag.body.tagId } });
     assert.equal((await json(base, "POST", `/api/v1/videos/${contentId}/publish`, undefined, token)).status, 200);
-    assert.equal((await json(base, "PATCH", `/api/v1/videos/${contentId}`, { title: "Changed" }, token)).status, 409);
+    assert.equal((await json(base, "PATCH", `/api/v1/videos/${contentId}`, { title: "Changed" }, token)).status, 200);
     assert.equal((await json(base, "POST", `/api/v1/videos/${contentId}/takedown`, undefined, token)).status, 200);
     assert.equal((await json(base, "PATCH", `/api/v1/videos/${contentId}`, { title: "Revised" }, token)).status, 200);
     await json(base, "POST", `/api/v1/videos/${contentId}/publish`, undefined, token);
@@ -282,7 +312,7 @@ test("migration, constraints, and API", async (t) => {
     await prisma.contentCategory.create({ data: { contentId, categoryId: category.categoryId } });
     const listed = await json(base, "GET", "/api/v1/content?category=trending&q=Revised");
     assert.equal(listed.body.items.length, 1);
-    const draft = await json(base, "POST", "/api/v1/videos", { title: "Hidden" }, token);
+    const draft = await json(base, "POST", "/api/v1/videos", { description: "Hidden draft" }, token);
     const browse = await json(base, "GET", "/api/v1/content?q=Hidden");
     assert.equal(browse.body.items.length, 0);
     const bookmark = await json(base, "POST", "/api/v1/bookmarks", { contentId }, token);
@@ -297,14 +327,11 @@ test("migration, constraints, and API", async (t) => {
     const course = await json(base, "POST", "/api/v1/courses", { title: "Course" }, token);
     const module = await json(base, "POST", `/api/v1/courses/${course.body.contentId}/modules`, { title: "Module", position: 1 }, token);
     assert.equal((await json(base, "POST", `/api/v1/modules/${module.body.moduleId}/lessons`, { title: "One", position: 1, videoContentId: contentId }, token)).status, 201);
-    const videoB = await json(base, "POST", "/api/v1/videos", { title: "Second", durationSeconds: 50 }, token);
+    const videoB = await json(base, "POST", "/api/v1/videos", { description: "Second", durationSeconds: 50 }, token);
     await json(base, "PUT", `/api/v1/videos/${videoB.body.contentId}/media`, { mimeType: "video/mp4", dataBase64: Buffer.from("more").toString("base64"), durationSeconds: 50 }, token);
     assert.equal((await json(base, "POST", `/api/v1/modules/${module.body.moduleId}/lessons`, { title: "Two", position: 1, videoContentId: videoB.body.contentId }, token)).status, 409);
     assert.equal((await json(base, "POST", `/api/v1/modules/${module.body.moduleId}/lessons`, { title: "Two", position: 2, videoContentId: contentId }, token)).status, 409);
     assert.equal((await json(base, "POST", `/api/v1/modules/${module.body.moduleId}/lessons`, { title: "Two", position: 2, videoContentId: videoB.body.contentId }, token)).status, 201);
-    assert.equal((await json(base, "POST", `/api/v1/courses/${course.body.contentId}/publish`, undefined, token)).status, 400);
-    await json(base, "PATCH", `/api/v1/videos/${videoB.body.contentId}`, { description: "Second video", keywords: "second", sources: "notes" }, token);
-    await prisma.contentTag.create({ data: { contentId: videoB.body.contentId, tagId: tag.body.tagId } });
     assert.equal((await json(base, "POST", `/api/v1/courses/${course.body.contentId}/publish`, undefined, token)).status, 200);
     const courseProgress = await json(base, "GET", `/api/v1/courses/${course.body.contentId}/progress`, undefined, token);
     assert.equal(courseProgress.body.totalDurationSeconds, 150);

@@ -68,6 +68,7 @@ await prisma.appUser.create({
   data: {
     roleId: adminRole.roleId,
     emailNormalized: "admin@example.com",
+    usernameNormalized: "admin_user",
     displayName: "Admin",
     accountStatus: "ACTIVE",
     passwordHash: await hashPassword(adminPassword, config),

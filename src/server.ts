@@ -9,7 +9,7 @@ import { googleJwksVerifier } from "./google.js";
 import { createLogger } from "./logger.js";
 import type { ApiDeps } from "./routes.js";
 import { seedReferenceData } from "./db/seed.js";
-import { localMediaStorage } from "./storage.js";
+import { createMediaStorage } from "./storage.js";
 
 const config = loadConfig();
 const logger = createLogger(config);
@@ -30,7 +30,7 @@ if (config.DATABASE_URL && config.TOKEN_SIGNING_SECRET) {
     google: config.GOOGLE_CLIENT_ID
       ? googleJwksVerifier(config.GOOGLE_CLIENT_ID)
       : { async verify() { throw new Error("google is not configured"); } },
-    storage: localMediaStorage(config.MEDIA_ROOT),
+    storage: createMediaStorage(config),
   };
   await seedReferenceData(deps.prisma);
 }

@@ -9,7 +9,8 @@ export { HttpError } from "./errors.js";
 export function createApp(config: AppConfig, logger: Logger, deps?: ApiDeps) {
   const app = express();
   app.disable("x-powered-by");
-  app.use(express.json({ limit: "1mb" }));
+  // Short videos are uploaded as base64 JSON; 1mb is far too small for that path.
+  app.use(express.json({ limit: "80mb" }));
 
   const allowedOrigins = new Set(config.CORS_ORIGINS.split(",").map((origin) => origin.trim()).filter(Boolean));
   app.use((req, res, next) => {
@@ -55,6 +56,12 @@ export function createApp(config: AppConfig, logger: Logger, deps?: ApiDeps) {
   const errorHandler: ErrorRequestHandler = (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: { code: err.code, message: err.message } });
+      return;
+    }
+    if (err && typeof err === "object" && "type" in err && (err as { type?: string }).type === "entity.too.large") {
+      res.status(413).json({
+        error: { code: "payload_too_large", message: "Video is too large. Use a shorter clip under about 60MB." },
+      });
       return;
     }
     logger.error("unhandled_error", { name: err instanceof Error ? err.name : "unknown" });
