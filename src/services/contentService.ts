@@ -11,6 +11,8 @@ type FeedItem = {
   publishedAt: Date | null;
   hasMedia?: boolean;
   mediaUrl?: string | null;
+  thumbnailUrl?: string | null;
+  commentCount?: number;
   categories: Array<{ name: string; slug: string }>;
 };
 
@@ -274,14 +276,42 @@ export function createContentService(access: Access) {
       return { contentId: content.contentId };
     },
 
-    async updateCourse(auth: Parameters<typeof ownContent>[0], contentId: string, title: unknown) {
+    async updateCourse(auth: Parameters<typeof ownContent>[0], contentId: string, body: Record<string, unknown>) {
       const content = await ownContent(auth, contentId);
-      if (content.status === "PUBLISHED") throw new HttpError(409, "conflict", "Published course cannot be edited in place");
+      if (content.contentType !== "COURSE" || content.deletedAt) throw new HttpError(404, "not_found", "Not found");
+      const title = typeof body.title === "string" ? body.title.trim() : undefined;
+      const description = typeof body.description === "string" ? body.description.trim() : undefined;
+      if (title !== undefined && !title) throw new HttpError(400, "validation", "Course name is required");
       await prisma.content.update({
         where: { contentId: content.contentId },
-        data: { title: typeof title === "string" ? title : undefined },
+        data: {
+          title: title || undefined,
+          description: description !== undefined ? description || null : undefined,
+        },
       });
       return { contentId: content.contentId };
+    },
+
+    async setCourseVisibility(
+      auth: Parameters<typeof ownContent>[0],
+      contentId: string,
+      visibility: unknown,
+    ) {
+      const content = await ownContent(auth, contentId);
+      if (content.contentType !== "COURSE" || content.deletedAt) throw new HttpError(404, "not_found", "Not found");
+      const next =
+        visibility === "PUBLISHED" || visibility === "public" ? "PUBLISHED"
+          : visibility === "UNPUBLISHED" || visibility === "private" || visibility === "DRAFT" ? "UNPUBLISHED"
+            : "";
+      if (!next) throw new HttpError(400, "validation", "Visibility must be public or private");
+      if (next === "PUBLISHED") {
+        return this.publishCourse(auth, contentId);
+      }
+      await prisma.content.update({
+        where: { contentId: content.contentId },
+        data: { status: "UNPUBLISHED" },
+      });
+      return { status: "UNPUBLISHED" as const };
     },
 
     async addModule(auth: Parameters<typeof ownContent>[0], contentId: string, body: Record<string, unknown>) {
@@ -316,7 +346,7 @@ export function createContentService(access: Access) {
         const lesson = await prisma.lesson.create({ data: { moduleId: module.moduleId, title, position: position as number, videoContentId } });
         return { lessonId: lesson.lessonId };
       } catch {
-        throw new HttpError(409, "conflict", "Video is already in a playlist or position is taken");
+        throw new HttpError(409, "conflict", "Video is already in a course or position is taken");
       }
     },
 
@@ -339,8 +369,10 @@ export function createContentService(access: Access) {
       if (!video || video.contentType !== "VIDEO" || video.deletedAt) {
         throw new HttpError(404, "not_found", "Video not found");
       }
-      const already = await prisma.lesson.findUnique({ where: { videoContentId } });
-      if (already) throw new HttpError(409, "conflict", "Video is already in a playlist");
+      const alreadyInPlaylist = await prisma.lesson.findFirst({
+        where: { videoContentId, module: { courseContentId } },
+      });
+      if (alreadyInPlaylist) throw new HttpError(409, "conflict", "Video is already in this course");
 
       let module = await prisma.courseModule.findFirst({
         where: { courseContentId },
@@ -355,10 +387,14 @@ export function createContentService(access: Access) {
       }
       const position = module.lessons.length + 1;
       const title = (video.description?.trim() || video.title || "Video").slice(0, 80);
-      const lesson = await prisma.lesson.create({
-        data: { moduleId: module.moduleId, title, position, videoContentId },
-      });
-      return { lessonId: lesson.lessonId, moduleId: module.moduleId, position };
+      try {
+        const lesson = await prisma.lesson.create({
+          data: { moduleId: module.moduleId, title, position, videoContentId },
+        });
+        return { lessonId: lesson.lessonId, moduleId: module.moduleId, position };
+      } catch {
+        throw new HttpError(409, "conflict", "Could not add video to course");
+      }
     },
 
     async deleteCourse(auth: Parameters<typeof ownContent>[0], contentId: string) {
@@ -413,16 +449,20 @@ export function createContentService(access: Access) {
       });
       return {
         limit: LIST_LIMIT,
-        items: items.map((item) => ({
-          contentId: item.contentId,
-          contentType: item.contentType,
-          title: item.title,
-          description: item.description,
-          status: item.status,
-          updatedAt: item.updatedAt,
-          publishedAt: item.publishedAt,
-          hasMedia: Boolean(item.video?.mediaReference),
-        })),
+        items: items.map((item) => {
+          const reference = item.video?.mediaReference ?? "";
+          return {
+            contentId: item.contentId,
+            contentType: item.contentType,
+            title: item.title,
+            description: item.description,
+            status: item.status,
+            updatedAt: item.updatedAt,
+            publishedAt: item.publishedAt,
+            hasMedia: Boolean(reference),
+            thumbnailUrl: reference ? deps.storage.thumbnailUrl(reference) : null,
+          };
+        }),
       };
     },
 
@@ -458,6 +498,7 @@ export function createContentService(access: Access) {
         include: {
           video: true,
           categories: { include: { category: true } },
+          _count: { select: { comments: { where: { deletedAt: null } } } },
         },
       });
 
@@ -471,6 +512,8 @@ export function createContentService(access: Access) {
           publishedAt: item.publishedAt,
           hasMedia: Boolean(reference),
           mediaUrl: reference ? deps.storage.playbackUrl(reference, "feed") : null,
+          thumbnailUrl: reference ? deps.storage.thumbnailUrl(reference) : null,
+          commentCount: item._count.comments,
           categories: item.categories.map((row) => ({
             name: row.category.name,
             slug: row.category.slug,

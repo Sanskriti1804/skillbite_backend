@@ -143,7 +143,12 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
   router.patch("/courses/:contentId", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);
     requireRole(session, ["CREATOR", "ADMIN"]);
-    res.status(200).json(await content.updateCourse(session, req.params.contentId, body(req).title));
+    res.status(200).json(await content.updateCourse(session, req.params.contentId, body(req)));
+  }));
+  router.patch("/courses/:contentId/visibility", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    requireRole(session, ["CREATOR", "ADMIN"]);
+    res.status(200).json(await content.setCourseVisibility(session, req.params.contentId, body(req).visibility ?? body(req).status));
   }));
   router.post("/courses/:contentId/modules", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);
@@ -201,6 +206,21 @@ export function createApiRouter(config: AppConfig, deps: ApiDeps): Router {
   router.get("/me/bookmarks", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);
     res.status(200).json(await learning.bookmarks(session.userId));
+  }));
+  router.get("/content/:contentId/comments", asyncHandler(async (req, res) => {
+    await requireAuth(req);
+    res.status(200).json(await learning.listComments(req.params.contentId));
+  }));
+  router.post("/content/:contentId/comments", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    const payload = body(req);
+    res.status(201).json(
+      await learning.addComment(session.userId, req.params.contentId, payload.body, payload.parentCommentId),
+    );
+  }));
+  router.delete("/comments/:commentId", asyncHandler(async (req, res) => {
+    const session = await requireAuth(req);
+    res.status(200).json(await learning.deleteComment(session.userId, req.params.commentId));
   }));
   router.put("/videos/:contentId/progress", asyncHandler(async (req, res) => {
     const session = await requireAuth(req);

@@ -41,12 +41,17 @@ export function createAccess(config: AppConfig, deps: ApiDeps) {
     } catch {
       throw new HttpError(401, "unauthorized", "Authentication required");
     }
-    const session = await prisma.userSession.findUnique({ where: { sessionId: claims.sessionId } });
     const now = new Date();
+    const [session, user] = await Promise.all([
+      prisma.userSession.findUnique({ where: { sessionId: claims.sessionId } }),
+      prisma.appUser.findUnique({
+        where: { userId: claims.userId },
+        select: { userId: true, accountStatus: true, role: { select: { code: true } } },
+      }),
+    ]);
     if (!session || session.userId !== claims.userId || session.revokedAt || session.expiresAt <= now) {
       throw new HttpError(401, "unauthorized", "Authentication required");
     }
-    const user = await prisma.appUser.findUnique({ where: { userId: claims.userId }, include: { role: true } });
     if (!user || user.accountStatus !== "ACTIVE") throw new HttpError(403, "forbidden", "Account is not active");
     return { userId: user.userId, sessionId: session.sessionId, role: user.role.code, status: user.accountStatus };
   }

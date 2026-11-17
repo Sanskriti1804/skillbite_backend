@@ -16,6 +16,8 @@ export interface MediaStorage {
   read(reference: string): Promise<Buffer>;
   /** Direct playable URL when available (Cloudinary CDN). Null for local-only files. */
   playbackUrl(reference: string, quality?: PlaybackQuality): string | null;
+  /** Still-frame preview for grids. Null when not available. */
+  thumbnailUrl(reference: string): string | null;
 }
 
 export type CloudinaryConfig = {
@@ -52,6 +54,9 @@ export function localMediaStorage(root: string): MediaStorage {
       return readFile(target);
     },
     playbackUrl() {
+      return null;
+    },
+    thumbnailUrl() {
       return null;
     },
   };
@@ -97,6 +102,21 @@ export function cloudinaryMediaStorage(config: CloudinaryConfig): MediaStorage {
       secure: true,
       sign_url: true,
       transformation,
+    });
+  }
+
+  function stillUrl(publicId: string): string {
+    return cloudinary.url(publicId, {
+      resource_type: "video",
+      type: "upload",
+      secure: true,
+      sign_url: true,
+      format: "jpg",
+      transformation: [
+        { start_offset: "auto" },
+        { width: 480, height: 720, crop: "fill", gravity: "auto" },
+        { quality: "auto:eco" },
+      ],
     });
   }
 
@@ -151,6 +171,11 @@ export function cloudinaryMediaStorage(config: CloudinaryConfig): MediaStorage {
       const publicId = reference.slice(CLOUDINARY_REF_PREFIX.length);
       return deliveryUrl(publicId, quality);
     },
+    thumbnailUrl(reference: string): string | null {
+      if (!reference.startsWith(CLOUDINARY_REF_PREFIX)) return null;
+      const publicId = reference.slice(CLOUDINARY_REF_PREFIX.length);
+      return stillUrl(publicId);
+    },
   };
 }
 
@@ -188,6 +213,12 @@ export function createMediaStorage(config: AppConfig): MediaStorage {
         return remote.playbackUrl(reference, quality);
       }
       return local.playbackUrl(reference, quality);
+    },
+    thumbnailUrl(reference: string): string | null {
+      if (reference.startsWith(CLOUDINARY_REF_PREFIX)) {
+        return remote.thumbnailUrl(reference);
+      }
+      return local.thumbnailUrl(reference);
     },
   };
 }

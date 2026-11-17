@@ -35,6 +35,7 @@ model AppUser {
   sessions                UserSession[]
   content                 Content[]
   bookmarks               Bookmark[]
+  comments                Comment[]
   progress                VideoProgress[]
   notifications           Notification[]
   notificationPreferences NotificationPreference[]
@@ -130,6 +131,7 @@ model Content {
   tags         ContentTag[]
   attachments  ContentAttachment[]
   bookmarks    Bookmark[]
+  comments     Comment[]
 
   @@index([creatorId, status])
   @@map("content")
@@ -142,7 +144,7 @@ model VideoDetails {
   sources         String?
 
   content  Content         @relation(fields: [contentId], references: [contentId], onDelete: Restrict, onUpdate: Restrict)
-  lesson   Lesson?
+  lessons  Lesson[]
   captions VideoCaption[]
   progress VideoProgress[]
 
@@ -176,7 +178,7 @@ model CourseModule {
 model Lesson {
   lessonId       String   @id @default(uuid()) @map("lesson_id") @db.Uuid
   moduleId       String   @map("module_id") @db.Uuid
-  videoContentId String   @unique @map("video_content_id") @db.Uuid
+  videoContentId String   @map("video_content_id") @db.Uuid
   title          String
   position       Int
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
@@ -186,6 +188,8 @@ model Lesson {
   video  VideoDetails @relation(fields: [videoContentId], references: [contentId], onDelete: Restrict, onUpdate: Restrict)
 
   @@unique([moduleId, position])
+  @@unique([moduleId, videoContentId])
+  @@index([videoContentId])
   @@map("lesson")
 }
 
@@ -271,6 +275,27 @@ model Bookmark {
 
   @@id([userId, contentId])
   @@map("bookmark")
+}
+
+model Comment {
+  commentId       String    @id @default(uuid()) @map("comment_id") @db.Uuid
+  contentId       String    @map("content_id") @db.Uuid
+  userId          String    @map("user_id") @db.Uuid
+  parentCommentId String?   @map("parent_comment_id") @db.Uuid
+  body            String
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  content  Content   @relation(fields: [contentId], references: [contentId], onDelete: Restrict, onUpdate: Restrict)
+  user     AppUser   @relation(fields: [userId], references: [userId], onDelete: Restrict, onUpdate: Restrict)
+  parent   Comment?  @relation("CommentThread", fields: [parentCommentId], references: [commentId], onDelete: Restrict, onUpdate: Restrict)
+  replies  Comment[] @relation("CommentThread")
+
+  @@index([contentId, createdAt])
+  @@index([userId, createdAt])
+  @@index([parentCommentId, createdAt])
+  @@map("comment")
 }
 
 model VideoProgress {
